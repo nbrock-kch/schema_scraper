@@ -163,6 +163,42 @@ schema_docs/{database_name}/
     └── {schema}.md                  # All objects per schema
 ```
 
+## Known issues
+
+### SQL Server row counts are multiplied for tables with LOB columns
+
+`MSSQLExtractor._get_table_stats` (`src/schema_scraper/backends/mssql/extractors.py`) computes
+`SUM(p.rows)` over `sys.partitions` **joined to `sys.allocation_units`**. A heap or clustered index
+with `varchar(max)` / `nvarchar(max)` / `xml` / `varbinary(max)` columns owns up to three allocation
+units (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), so the join repeats each partition row once per
+unit and the reported **Rows** figure is 2x or 3x the real count. The space figures are unaffected
+(they are per allocation unit by design).
+
+Confirmed 2026-10-02 against SQL1.Keystone (scrape of 2026-09-22 vs live counts of the same tables
+landed by a nightly full copy): `appdata.CustomerDemographics` reported 11,070 vs 3,690 live (two
+`nvarchar(max)` columns, exactly 3x); `dbo.Development` 1,242 vs 414 (3x); `dbo.Customers` 97,221 vs
+32,464 (3x within a day's growth). Tables without LOB columns are reported correctly.
+
+Until this is fixed, treat the **Rows** statistic for any table that lists a `(max)` / `xml` /
+`text` column as an upper bound, not a count. The fix is to take the row count from `sys.partitions`
+alone (one row per partition, `index_id IN (0, 1)`) and join `sys.allocation_units` only for the space
+sums, e.g.
+
+```sql
+SELECT
+    (SELECT SUM(p.rows) FROM sys.partitions p
+      WHERE p.object_id = t.object_id AND p.index_id IN (0, 1))       AS row_count,
+    SUM(a.total_pages) * 8                                              AS total_space_kb,
+    SUM(a.used_pages)  * 8                                              AS used_space_kb
+FROM sys.tables t
+JOIN sys.schemas s          ON t.schema_id = s.schema_id
+JOIN sys.indexes i          ON t.object_id = i.object_id AND i.index_id IN (0, 1)
+JOIN sys.partitions p       ON i.object_id = p.object_id AND i.index_id = p.index_id
+JOIN sys.allocation_units a ON p.partition_id = a.container_id
+WHERE s.name = ? AND t.name = ?
+GROUP BY t.object_id;
+```
+
 ## What Gets Documented
 
 ### Tables
@@ -171,7 +207,7 @@ schema_docs/{database_name}/
 - Foreign keys (columns, referenced table, ON DELETE/UPDATE actions)
 - All indexes (type, columns, included columns, filters)
 - Check constraints with full definitions
-- Row count and space usage statistics
+- Row count and space usage statistics (**SQL Server caveat:** the row count is over-stated for tables with LOB columns — see [Known issues](#known-issues))
 - Relationship graph (what references this table, what it references)
 
 ### Views
