@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.1/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Known issues
+- **SQL Server `Rows` statistic multiplied for tables with more than one allocation unit**: `_get_table_stats` sums `sys.partitions.rows` across the `sys.allocation_units` join, so a table with `(max)` / `xml` columns (LOB unit) or page-overflowing rows (row-overflow unit) reports 2-3x its real row count (confirmed 2026-10-02 on five tables, e.g. `appdata.CustomerDemographics` 11,070 reported vs 3,690 actual; `dbo.Lot` 28,714 vs 14,363). Space figures are correct. See README → Known issues for the validation query and the corrected query. Not yet fixed in code.
+
 ## [0.3.0] - 2026-02-18
 
 ### Added

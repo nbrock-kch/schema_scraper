@@ -163,6 +163,82 @@ schema_docs/{database_name}/
     └── {schema}.md                  # All objects per schema
 ```
 
+## Known issues
+
+### SQL Server row counts are multiplied for tables with LOB columns
+
+`MSSQLExtractor._get_table_stats` (`src/schema_scraper/backends/mssql/extractors.py`) computes
+`SUM(p.rows)` over `sys.partitions` **joined to `sys.allocation_units`**. A heap or clustered index
+with `varchar(max)` / `nvarchar(max)` / `xml` / `varbinary(max)` columns, or rows wide enough to overflow a page, owns up to three allocation
+units (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), so the join repeats each partition row once per
+unit and the reported **Rows** figure is 2x or 3x the real count. The space figures are unaffected
+(they are per allocation unit by design).
+
+Confirmed 2026-10-02 against SQL1.Keystone (scrape of 2026-09-22 vs live counts of the same tables
+landed by a nightly full copy): `appdata.CustomerDemographics` reported 11,070 vs 3,690 live (two
+`nvarchar(max)` columns, exactly 3x); `dbo.Development` 1,242 vs 414 (3x); `dbo.Customers` 97,221 vs
+32,464 (3x within a day's growth); `dbo.Lot`, a wide table with no `(max)` column, 28,714 vs 14,363 (2x: an extra row-overflow unit). A table with a single allocation unit is reported correctly.
+
+#### Validation (2026-10-02)
+
+Scraped **Rows** (SQL1.Keystone, scrape of 2026-09-22) against the real count of the same table. Live counts came from
+a nightly full copy of each table into a lakehouse (`COUNT(*)` on the landed copy, 2026-10-02) and, for the last row,
+from a `COUNT(*)` run directly in SSMS the same day. Every table with a `(max)` column reports 3x. The last row is a
+wide table with no `(max)` column that still reports 2x: consistent with an `IN_ROW_DATA` + `ROW_OVERFLOW_DATA` pair
+(inferred from the ratio; the query below confirms it per table), so the multiplier is the number of allocation
+units, not the presence of a LOB column as such.
+
+| Table | `(max)` columns | Scraped Rows | Real rows | Ratio |
+|---|---|---|---|---|
+| `appdata.CustomerDemographics` | 4 x `nvarchar(max)` | 11,070 | 3,690 | 3.00 |
+| `dbo.Development` | 2 x `varchar(max)` | 1,242 | 414 | 3.00 |
+| `dbo.Customers` | 2 x `nvarchar(max)` | 97,221 | 32,464 (one day later) | 2.99 |
+| `app.DocuSignEnvelopes` | 1 x `nvarchar(max)` | 23,877 | 7,985 (26 rows added since the scrape) | 2.99 |
+| `dbo.Lot` | none (wide row) | 28,714 | 14,363 | 2.00 |
+
+Reproduce on any SQL Server database (read-only; the first column is what the extractor reports today, the second
+is the correct figure, the third is the number of allocation units that caused the multiplication):
+
+```sql
+SELECT  s.name AS schema_name, t.name AS table_name,
+        SUM(p.rows)                                          AS rows_as_scraped,
+        (SELECT SUM(p2.rows) FROM sys.partitions p2
+          WHERE p2.object_id = t.object_id AND p2.index_id IN (0, 1)) AS rows_actual,
+        COUNT(*)                                             AS allocation_units
+FROM    sys.tables t
+JOIN    sys.schemas s          ON t.schema_id = s.schema_id
+JOIN    sys.indexes i          ON t.object_id = i.object_id AND i.index_id IN (0, 1)
+JOIN    sys.partitions p       ON i.object_id = p.object_id AND i.index_id = p.index_id
+JOIN    sys.allocation_units a ON p.partition_id = a.container_id
+GROUP BY s.name, t.name, t.object_id
+HAVING  SUM(p.rows) <> (SELECT SUM(p2.rows) FROM sys.partitions p2
+                         WHERE p2.object_id = t.object_id AND p2.index_id IN (0, 1))
+ORDER BY s.name, t.name;
+```
+
+An empty result means no table on that database is affected (no LOB or row-overflow allocation units). Each row
+returned is a table whose scraped **Rows** is wrong by the factor `allocation_units`.
+
+Until this is fixed, treat the **Rows** statistic for any table that lists a `(max)` / `xml` /
+`text` column as an upper bound, not a count. The fix is to take the row count from `sys.partitions`
+alone (one row per partition, `index_id IN (0, 1)`) and join `sys.allocation_units` only for the space
+sums, e.g.
+
+```sql
+SELECT
+    (SELECT SUM(p.rows) FROM sys.partitions p
+      WHERE p.object_id = t.object_id AND p.index_id IN (0, 1))       AS row_count,
+    SUM(a.total_pages) * 8                                              AS total_space_kb,
+    SUM(a.used_pages)  * 8                                              AS used_space_kb
+FROM sys.tables t
+JOIN sys.schemas s          ON t.schema_id = s.schema_id
+JOIN sys.indexes i          ON t.object_id = i.object_id AND i.index_id IN (0, 1)
+JOIN sys.partitions p       ON i.object_id = p.object_id AND i.index_id = p.index_id
+JOIN sys.allocation_units a ON p.partition_id = a.container_id
+WHERE s.name = ? AND t.name = ?
+GROUP BY t.object_id;
+```
+
 ## What Gets Documented
 
 ### Tables
@@ -171,7 +247,7 @@ schema_docs/{database_name}/
 - Foreign keys (columns, referenced table, ON DELETE/UPDATE actions)
 - All indexes (type, columns, included columns, filters)
 - Check constraints with full definitions
-- Row count and space usage statistics
+- Row count and space usage statistics (**SQL Server caveat:** the row count is over-stated for tables with LOB columns — see [Known issues](#known-issues))
 - Relationship graph (what references this table, what it references)
 
 ### Views
